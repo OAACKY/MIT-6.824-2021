@@ -20,8 +20,6 @@ type Coordinator struct {
 	reduceFinish   int
 	mapIsfinish    bool
 	reduceIsfinish bool
-	timerset       bool
-	beginTime      time.Time
 	mux            sync.Mutex
 }
 
@@ -35,11 +33,6 @@ func (c *Coordinator) MrHandler(args *MrArgs, reply *MrReply) error {
 				defer c.mux.Unlock()
 				return nil
 			} else { // do reduce task
-				if c.timerset == false {
-					c.beginTime = time.Now()
-					c.timerset = true
-				}
-				reply.TaskNum = 0
 				reply.Type = 1
 				reply.MapNum = len(c.fileName)
 				i, k := 0, 0
@@ -50,13 +43,7 @@ func (c *Coordinator) MrHandler(args *MrArgs, reply *MrReply) error {
 				}
 				if k != 0 {
 					defer c.mux.Unlock()
-					cost := time.Since(c.beginTime)
-					if cost < 20*time.Second {
-						reply.TaskNum = -1 //wait if some reduce task are being done
-					} else {
-						//fmt.Println("got it 2")
-						reply.TaskNum = 0
-					}
+					reply.TaskNum = -1
 					return nil
 				}
 				reply.TaskNum = i
@@ -75,11 +62,6 @@ func (c *Coordinator) MrHandler(args *MrArgs, reply *MrReply) error {
 				return nil
 			}
 		} else { // check if some map task are being done
-			if c.timerset == false {
-				c.beginTime = time.Now()
-				c.timerset = true
-			}
-			reply.TaskNum = 0
 			reply.Type = 0
 			reply.ReduceNum = c.nReduce
 			i, k := 0, 0
@@ -90,14 +72,7 @@ func (c *Coordinator) MrHandler(args *MrArgs, reply *MrReply) error {
 			}
 			if k != 0 {
 				defer c.mux.Unlock()
-				cost := time.Since(c.beginTime)
-				if cost < 20*time.Second {
-					reply.TaskNum = -1 //wait if some map task are being done
-				} else {
-					//fmt.Println("got it!")
-					reply.TaskNum = 0
-					reply.FileName = c.fileName[0]
-				}
+				reply.TaskNum = -1
 				return nil
 			}
 			reply.TaskNum = i
@@ -126,7 +101,6 @@ func (c *Coordinator) MrHandler(args *MrArgs, reply *MrReply) error {
 			c.mapFinish++
 			if c.mapFinish == len(c.fileName) {
 				c.mapIsfinish = true
-				c.timerset = false
 			}
 		} else {
 			if c.reduceState[args.TaskNum] == 2 {
