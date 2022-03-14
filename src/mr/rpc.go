@@ -23,7 +23,19 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type MrArgs struct {
+	Type     int // 0 for map 1 for reduce
+	IsFinish bool
+	TaskNum  int
+}
 
+type MrReply struct {
+	Type      int // 0 for map 1 for reduce
+	TaskNum   int
+	FileName  string
+	MapNum    int
+	ReduceNum int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
