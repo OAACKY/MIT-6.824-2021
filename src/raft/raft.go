@@ -107,6 +107,9 @@ type Raft struct {
 	// For the last includedindex
 	firstIndex int
 	firstTerm  int
+
+	isWait   bool
+	waitChan chan bool
 }
 
 // return currentTerm and whether this server
@@ -576,6 +579,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		DPrintf("--- add new log entry to [%d] cmd:%d index:%d term:%d time:%v", rf.me, command, newEntry.Index, newEntry.Term, time.Now())
 		index = newEntry.Index
 		term = newEntry.Term
+		if rf.isWait {
+			DPrintf("did this")
+			rf.isWait = false
+			rf.waitChan <- true
+		}
+		DPrintf("has done")
 	}
 
 	return index, term, isLeader
@@ -619,6 +628,7 @@ func (rf *Raft) startLeader() {
 
 	for rf.killed() == false {
 		DPrintf("[%d] leader begin send, time:%v", rf.me, time.Now())
+		tempTime := time.Now()
 		rf.mu.Lock()
 		if rf.state != Leader {
 			DPrintf("[%d] is not leader", rf.me)
@@ -673,7 +683,7 @@ func (rf *Raft) startLeader() {
 					reply := AppendEntriesReply{}
 
 					args.PrevLogIndex = rf.nextIndex[x] - 1
-					if args.PrevLogIndex > 0 && args.PrevLogIndex < rf.firstIndex {
+					if args.PrevLogIndex >= 0 && args.PrevLogIndex < rf.firstIndex {
 						// need to send snapshot
 						snapshotArgs := InstallSnapshotArgs{}
 						snapshotReply := InstallSnapshotReply{}
@@ -715,7 +725,7 @@ func (rf *Raft) startLeader() {
 						return
 					}
 
-					DPrintf("leader[%d]->args[%d].PrevLogIndex:%d", rf.me, x, args.PrevLogIndex)
+					DPrintf("leader[%d]->args[%d].PrevLogIndex:%d firstIndex:%d replicaNum:%d", rf.me, x, args.PrevLogIndex, rf.firstIndex, replicaLogNum)
 					if args.PrevLogIndex == rf.firstIndex {
 						args.PrevLogTerm = rf.firstTerm
 					} else {
@@ -723,6 +733,10 @@ func (rf *Raft) startLeader() {
 					}
 
 					// replicalogNum become the length of leader's log
+					if replicaLogNum < args.PrevLogIndex {
+						rf.mu.Unlock()
+						return
+					}
 					entries := make([]Entry, replicaLogNum-args.PrevLogIndex)
 					copy(entries, rf.log[args.PrevLogIndex-rf.firstIndex:replicaLogNum-rf.firstIndex])
 					args.Entries = entries
@@ -814,7 +828,7 @@ func (rf *Raft) startLeader() {
 			if replicaLogNum == rf.getLastIndex() {
 				rf.newCommand = false
 			}
-			if replicaLogNum > rf.getLastIndex() && rf.getEntry(replicaLogNum).Term == rf.currentTerm {
+			if replicaLogNum > rf.firstIndex && rf.getEntry(replicaLogNum).Term == rf.currentTerm {
 				DPrintf("most peers agree leader[%d] replicaLogNum:%d", rf.me, replicaLogNum)
 				rf.commitIndex = replicaLogNum
 				rf.applyCond.Broadcast()
@@ -842,8 +856,34 @@ func (rf *Raft) startLeader() {
 				}
 			}
 		}
-		rf.mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
+		if !rf.newCommand {
+			tempSleep := time.Since(tempTime).Milliseconds()
+			if tempSleep > 100 {
+				rf.mu.Unlock()
+				continue
+			}
+			timeOut := time.Tick(time.Duration(100-tempSleep) * time.Millisecond)
+
+			rf.isWait = true
+			rf.mu.Unlock()
+			DPrintf("what?? %d", rf.me)
+			select {
+			case out := <-rf.waitChan:
+				DPrintf("has waitChan %v", out)
+				break
+			case <-timeOut:
+				rf.mu.Lock()
+				if rf.isWait == false {
+					<-rf.waitChan
+				}
+				rf.isWait = false
+				rf.mu.Unlock()
+				DPrintf("has timeOut")
+				break
+			}
+		} else {
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -1002,8 +1042,8 @@ func (rf *Raft) ticker() {
 			}
 			rf.state = Candidate
 			rf.persist()
-			rf.mu.Unlock()
 			DPrintf("[%d] begin startcandidate, before term:%d time: %v", rf.me, rf.currentTerm, time.Now())
+			rf.mu.Unlock()
 
 			go rf.startCandidate()
 			continue
@@ -1034,6 +1074,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+	rf.waitChan = make(chan bool, 1)
 	rf.votedFor = -1
 
 	rf.applyCh = applyCh

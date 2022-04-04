@@ -4,10 +4,12 @@ import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastRPC       int
+	clientId      int64
+	lastSerialNum int64
 }
 
 func nrand() int64 {
@@ -21,6 +23,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.lastRPC = -1
+	ck.clientId = nrand()
+	ck.lastSerialNum = 0
 	return ck
 }
 
@@ -39,7 +44,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	ck.lastSerialNum++
+
+	args := GetArgs{}
+	reply := GetReply{}
+	args.Key = key
+	args.ClientId = ck.clientId
+	args.SerialNum = ck.lastSerialNum
+
+	res := ""
+
+	DPrintf("client[%d] begin send Get,key: %s", ck.clientId, key)
+	if ck.lastRPC != -1 {
+		ok := ck.servers[ck.lastRPC].Call("KVServer.Get", &args, &reply)
+		if ok && reply.Err != ErrWrongLeader {
+			res = reply.Value
+			return res
+		}
+	}
+	for {
+		for i := 0; i < len(ck.servers); {
+			ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+			if !ok || reply.Err == ErrWrongLeader {
+				i++
+				continue
+			}
+			ck.lastRPC = i
+			res = reply.Value
+			return res
+		}
+	}
 }
 
 //
@@ -54,6 +88,37 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.lastSerialNum++
+
+	args := PutAppendArgs{}
+	reply := PutAppendReply{}
+	args.Key = key
+	args.Value = value
+	args.Op = op
+	args.ClientId = ck.clientId
+	args.SerialNum = ck.lastSerialNum
+
+	DPrintf("client[%d] begin send PutAppend,key: %s, value: %s", ck.clientId, key, value)
+	if ck.lastRPC != -1 {
+		ok := ck.servers[ck.lastRPC].Call("KVServer.PutAppend", &args, &reply)
+		if ok && reply.Err == OK {
+			return
+		}
+	}
+	for {
+		for i := 0; i < len(ck.servers); {
+			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+			if !ok || reply.Err == ErrWrongLeader {
+				i++
+				continue
+			}
+			if reply.Err == OK {
+				ck.lastRPC = i
+				return
+			}
+			i++
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

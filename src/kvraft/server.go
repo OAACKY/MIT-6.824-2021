@@ -7,9 +7,12 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
+
+type OpType int
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +21,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+// define OpType
+const (
+	GetType OpType = iota
+	PutType
+	AppendType
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Optype OpType
+	Cid    int64
+	SeNum  int64
+	Key    string
+	Value  string
 }
 
 type KVServer struct {
@@ -35,15 +49,177 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	KV         map[string]string
+	lastSerial map[int64]int64
+	leaderGet  map[int]chan Op
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] kvServer receive Get, key:%s", kv.me, args.Key)
+	op := Op{}
+	op.Optype = GetType
+	op.Key = args.Key
+	op.Cid = args.ClientId
+	op.SeNum = args.SerialNum
+
+	opIndex, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] leader kvServer receive Get, key:%s cid:%d seNum:%d", kv.me, args.Key, args.ClientId, args.SerialNum)
+	kv.mu.Lock()
+	waitCh, ok := kv.leaderGet[opIndex]
+	if !ok {
+		kv.leaderGet[opIndex] = make(chan Op, 1)
+		waitCh = kv.leaderGet[opIndex]
+	}
+	kv.mu.Unlock()
+
+	timeOut := time.Tick(500 * time.Millisecond)
+	select {
+	case <-timeOut:
+		DPrintf("[%d] has timeOut cid:%d seNum:%d", kv.me, args.ClientId, args.SerialNum)
+		reply.Err = ErrWrongLeader
+	case res := <-waitCh:
+		DPrintf("[%d] leader has receive waitCh op.Cid:%d, op.SeNum:%d", kv.me, res.Cid, res.SeNum)
+		if res.Cid == op.Cid && res.SeNum == op.SeNum {
+			DPrintf("[%d] leader has receive waitCh op.Cid:%d, op.SeNum:%d ok!", kv.me, res.Cid, res.SeNum)
+			switch res.Optype {
+			case GetType:
+				kv.mu.Lock()
+				if kv.KV[res.Key] == "" {
+					reply.Err = ErrNoKey
+				} else {
+					reply.Err = OK
+				}
+				reply.Value = kv.KV[res.Key]
+				kv.mu.Unlock()
+			default:
+				panic("wrong! should not be a Put&Append!")
+			}
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
+	DPrintf("get here?")
+	kv.mu.Lock()
+	DPrintf("get here!")
+	closeChan, ok := kv.leaderGet[opIndex]
+	if ok {
+		close(closeChan)
+		delete(kv.leaderGet, opIndex)
+	}
+	DPrintf("get here!!!?")
+	kv.mu.Unlock()
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] kvServer receive PutAppend,key: %s, value: %s", kv.me, args.Key, args.Value)
+	op := Op{}
+	op.Key = args.Key
+	op.Value = args.Value
+	op.Cid = args.ClientId
+	op.SeNum = args.SerialNum
+
+	if args.Op == "Put" {
+		op.Optype = PutType
+	} else {
+		op.Optype = AppendType
+	}
+
+	opIndex, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] leader kvServer receive PutAppend,key: %s, value: %s cid:%d seNum:%d", kv.me, args.Key, args.Value, args.ClientId, args.SerialNum)
+	kv.mu.Lock()
+	waitCh, ok := kv.leaderGet[opIndex]
+	if !ok {
+		DPrintf("[%d] leader create chan cmd.index:%d", kv.me, opIndex)
+		kv.leaderGet[opIndex] = make(chan Op, 1)
+		waitCh = kv.leaderGet[opIndex]
+	}
+	kv.mu.Unlock()
+
+	timeOut := time.Tick(500 * time.Millisecond)
+	select {
+	case <-timeOut:
+		DPrintf("[%d] has timeOut cid:%d seNum:%d", kv.me, args.ClientId, args.SerialNum)
+		reply.Err = ErrWrongLeader
+	case res := <-waitCh:
+		DPrintf("[%d] leader has receive waitCh op.Cid:%d, op.SeNum:%d", kv.me, res.Cid, res.SeNum)
+		if res.Cid == op.Cid && res.SeNum == op.SeNum {
+			DPrintf("[%d] leader has receive waitCh op.Cid:%d, op.SeNum:%d ok!", kv.me, res.Cid, res.SeNum)
+			if res.Optype == GetType {
+				panic("wrong! should not be a Get!")
+			}
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
+	DPrintf("get here?")
+	kv.mu.Lock()
+	DPrintf("get here!")
+	closeChan, ok := kv.leaderGet[opIndex]
+	if ok {
+		close(closeChan)
+		delete(kv.leaderGet, opIndex)
+	}
+	DPrintf("get here!!!")
+	kv.mu.Unlock()
+	return
+
+}
+
+// start a goroutine to check whether a log is applied by raft
+func (kv *KVServer) CheckApply() {
+	for kv.killed() == false {
+		applyMsg := <-kv.applyCh
+		DPrintf("[%d] receive applyMsg", kv.me)
+		if applyMsg.CommandValid {
+			// apply the cmd
+			op := applyMsg.Command.(Op)
+			kv.mu.Lock()
+			DPrintf("[%d] receive applyMsg op.cid:%d op.seNum:%d applyMsg.cmdIndex:%d kv.lastSerial[op.cid]:%d", kv.me, op.Cid, op.SeNum, applyMsg.CommandIndex, kv.lastSerial[op.Cid])
+			if kv.lastSerial[op.Cid] < op.SeNum {
+				// check if duplicate
+				kv.lastSerial[op.Cid] = op.SeNum
+				switch op.Optype {
+				case GetType:
+					break
+				case PutType:
+					kv.KV[op.Key] = op.Value
+				case AppendType:
+					kv.KV[op.Key] += op.Value
+				}
+			}
+			// check if it's leader
+			waitCh, ok := kv.leaderGet[applyMsg.CommandIndex]
+			if ok {
+				DPrintf("[%d] leader has put in waitChan op.cid:%d op.seNum:%d", kv.me, op.Cid, op.SeNum)
+				waitCh <- op
+			}
+			kv.mu.Unlock()
+		} else {
+			// if it's snapshot
+		}
+
+	}
 }
 
 //
@@ -91,11 +267,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.KV = make(map[string]string)
+	kv.lastSerial = make(map[int64]int64)
+	kv.leaderGet = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.CheckApply()
 
 	return kv
 }
