@@ -13,3 +13,6 @@ mrtmp.*
 /raft/go-test-many.sh
 /raft/tester
 /raft/test-*
+/kvraft/go-test-many.sh
+/kvraft/tester
+/kvraft/test-*

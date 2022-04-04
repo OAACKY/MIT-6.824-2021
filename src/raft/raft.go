@@ -78,7 +78,7 @@ type Entry struct {
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
+	Persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
@@ -147,7 +147,7 @@ func (rf *Raft) persist() {
 		DPrintf("encode error!")
 	}
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.Persister.SaveRaftState(data)
 }
 
 //
@@ -200,10 +200,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.lastApplied > lastIncludedIndex {
+	if rf.commitIndex >= lastIncludedIndex {
 		return false
 	}
 
+	DPrintf("rf.getLastIndex:%d lastIncludedIndex:%d rf.firstIndex:%d", rf.getLastIndex(), lastIncludedIndex, rf.firstIndex)
 	if rf.getLastIndex() <= lastIncludedIndex || rf.getEntry(lastIncludedIndex).Term != lastIncludedTerm {
 		rf.log = nil
 	} else {
@@ -228,11 +229,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if index <= rf.firstIndex || index > rf.commitIndex {
+		return
+	}
+	DPrintf("[%d] receive snapshot index:%d firstIndex:%d", rf.me, index, rf.firstIndex)
 	tempTerm := rf.log[index-rf.firstIndex-1].Term
 	rf.log = shrinkEntriesArray(rf.log[index-rf.firstIndex:])
 	rf.firstIndex = index
 	rf.firstTerm = tempTerm
-	DPrintf("[%d] receive snapshot index:%d", rf.me, index)
 	rf.SaveStateAndSnapshot(snapshot)
 }
 
@@ -296,7 +300,7 @@ func (rf *Raft) SaveStateAndSnapshot(snapshot []byte) {
 		DPrintf("encode error!")
 	}
 	state := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(state, snapshot)
+	rf.Persister.SaveStateAndSnapshot(state, snapshot)
 }
 
 // shrinkEntries for go garbage collector to free and re-use the memory
@@ -493,24 +497,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// empty or match the index and term
 	if rf.getLastIndex() == 0 || args.PrevLogIndex == 0 || args.PrevLogIndex == rf.firstIndex || rf.getEntry(args.PrevLogIndex).Term == args.PrevLogTerm {
 		// delete the conflict entry
-		if rf.getLastIndex() > args.PrevLogIndex {
+		if rf.getLastIndex() > args.PrevLogIndex+len(args.Entries) {
+			for i, q := args.PrevLogIndex+1, 0; q < len(args.Entries); i, q = i+1, q+1 {
+				if rf.getEntry(i).Term != args.Entries[q].Term {
+					rf.log = shrinkEntriesArray(rf.log[:i-rf.firstIndex-1])
+					args.Entries = args.Entries[q:]
+					rf.log = append(rf.log, args.Entries...)
+					break
+				}
+			}
+		} else {
 			rf.log = shrinkEntriesArray(rf.log[:args.PrevLogIndex-rf.firstIndex])
-		}
-		if len(args.Entries) != 0 {
 			rf.log = append(rf.log, args.Entries...)
 		}
 		reply.Success = true
-		reply.MatchIndex = rf.getLastIndex()
-		DPrintf("[%d] accept append entry from [%d] len:%d", rf.me, args.LeaderId, len(rf.log))
+		if rf.getLastIndex() > args.PrevLogIndex+len(args.Entries) {
+			reply.MatchIndex = args.PrevLogIndex + len(args.Entries)
+		} else {
+			reply.MatchIndex = rf.getLastIndex()
+		}
+		DPrintf("[%d] accept append entry from [%d] len:%d rf.getLastIndex:%d", rf.me, args.LeaderId, len(rf.log), rf.getLastIndex())
 		// update commitIndex
 		if rf.getLastIndex() > 0 && args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit < rf.getLastIndex() {
+				DPrintf("[%d] change commit index:%d lastapplied:%d", rf.me, args.LeaderCommit, rf.lastApplied)
 				rf.commitIndex = args.LeaderCommit
 			} else {
+				DPrintf("[%d] change commit index:%d lastapplied:%d", rf.me, rf.getLastIndex(), rf.lastApplied)
 				rf.commitIndex = rf.getLastIndex()
 			}
 		}
 		if rf.commitIndex > rf.lastApplied {
+			DPrintf("[%d] begin applyCond.Broadcast 1 time:%v", rf.me, time.Now())
 			rf.applyCond.Broadcast()
 			//go rf.applyNewMsg()
 		}
@@ -687,13 +705,13 @@ func (rf *Raft) startLeader() {
 						// need to send snapshot
 						snapshotArgs := InstallSnapshotArgs{}
 						snapshotReply := InstallSnapshotReply{}
-						snapshotArgs.Snapshot = rf.persister.snapshot
+						snapshotArgs.Snapshot = rf.Persister.snapshot
 						snapshotArgs.Term = rf.currentTerm
 						snapshotArgs.LastIncludedIndex = rf.firstIndex
 						snapshotArgs.LastIncludedTerm = rf.firstTerm
 						snapshotArgs.LeaderId = rf.me
-						rf.mu.Unlock()
 						DPrintf("leader [%d] begin send snapshot to [%d] lastIncludedIndex:%d lastIncludedTerm:%d", rf.me, x, rf.firstIndex, rf.firstTerm)
+						rf.mu.Unlock()
 						t := rf.peers[x].Call("Raft.InstallSnapshot", &snapshotArgs, &snapshotReply)
 						tempLock.Lock()
 						ok = t
@@ -831,6 +849,7 @@ func (rf *Raft) startLeader() {
 			if replicaLogNum > rf.firstIndex && rf.getEntry(replicaLogNum).Term == rf.currentTerm {
 				DPrintf("most peers agree leader[%d] replicaLogNum:%d", rf.me, replicaLogNum)
 				rf.commitIndex = replicaLogNum
+				DPrintf("begin applycond.Broadcast 2")
 				rf.applyCond.Broadcast()
 			}
 			//go rf.applyNewMsg()
@@ -850,8 +869,10 @@ func (rf *Raft) startLeader() {
 				} else {
 					mid = len(tempArray) / 2
 				}
-				if tempArray[mid] > rf.commitIndex && rf.getEntry(tempArray[mid]).Term == rf.currentTerm {
+				DPrintf("[%d] leader tempArray[mid]:%d rf.commitIndex:%d rf.firstIndex:%d len(log):%d", rf.me, tempArray[mid], rf.commitIndex, rf.firstIndex, len(rf.log))
+				if tempArray[mid] > rf.commitIndex && (rf.commitIndex == 0 || rf.getEntry(tempArray[mid]).Term == rf.currentTerm) {
 					rf.commitIndex = tempArray[mid]
+					DPrintf("being applyCond.Broadcast 3")
 					rf.applyCond.Broadcast()
 				}
 			}
@@ -891,13 +912,16 @@ func (rf *Raft) startLeader() {
 
 func (rf *Raft) apply() {
 	for rf.killed() == false {
+		DPrintf("[%d] begin applier wait time:%v", rf.me, time.Now())
 		rf.mu.Lock()
+		DPrintf("[%d] begin applier get lock time:%v", rf.me, time.Now())
 		for rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
 		}
 		tempCommitIndex := rf.commitIndex
 		tempLastApplied := rf.lastApplied
 		entries := make([]Entry, tempCommitIndex-tempLastApplied)
+		DPrintf("[%d] tempLastApplied:%d tempCommitIndex:%d rf.firstIndex:%d len(log):%d", rf.me, tempLastApplied, tempCommitIndex, rf.firstIndex, len(rf.log))
 		copy(entries, rf.log[tempLastApplied-rf.firstIndex:tempCommitIndex-rf.firstIndex])
 		rf.mu.Unlock()
 		newMsg := ApplyMsg{}
@@ -1067,7 +1091,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
-	rf.persister = persister
+	rf.Persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).

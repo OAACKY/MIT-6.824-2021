@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,8 @@ type KVServer struct {
 	KV         map[string]string
 	lastSerial map[int64]int64
 	leaderGet  map[int]chan Op
+
+	lastApplied int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -193,6 +196,9 @@ func (kv *KVServer) CheckApply() {
 		DPrintf("[%d] receive applyMsg", kv.me)
 		if applyMsg.CommandValid {
 			// apply the cmd
+			if applyMsg.CommandIndex <= kv.lastApplied {
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			kv.mu.Lock()
 			DPrintf("[%d] receive applyMsg op.cid:%d op.seNum:%d applyMsg.cmdIndex:%d kv.lastSerial[op.cid]:%d", kv.me, op.Cid, op.SeNum, applyMsg.CommandIndex, kv.lastSerial[op.Cid])
@@ -208,6 +214,13 @@ func (kv *KVServer) CheckApply() {
 					kv.KV[op.Key] += op.Value
 				}
 			}
+
+			// check raftstate size
+			if kv.rf.Persister.RaftStateSize() > kv.maxraftstate && kv.maxraftstate != -1 {
+				DPrintf("[%d] kvserver has call the snapshot", kv.me)
+				kv.rf.Snapshot(applyMsg.CommandIndex, kv.encodeState())
+			}
+
 			// check if it's leader
 			waitCh, ok := kv.leaderGet[applyMsg.CommandIndex]
 			if ok {
@@ -217,8 +230,44 @@ func (kv *KVServer) CheckApply() {
 			kv.mu.Unlock()
 		} else {
 			// if it's snapshot
+			kv.mu.Lock()
+			DPrintf("[%d] server begin ask condInstallSnapShot", kv.me)
+			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+				// install this snapshot
+				kv.restoreState(kv.rf.Persister.ReadSnapshot())
+				kv.lastApplied = applyMsg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
 
+	}
+}
+
+// encode the latest kvserver state
+func (kv *KVServer) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.KV) != nil || e.Encode(kv.lastSerial) != nil {
+		DPrintf("kvServer encode error!")
+	}
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) restoreState(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	DPrintf("[%d] server begin restoreState", kv.me)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var tempKV map[string]string
+	var tempLastSerial map[int64]int64
+	if d.Decode(&tempKV) != nil || d.Decode(&tempLastSerial) != nil {
+		DPrintf("kvServer decode error!")
+	} else {
+		kv.KV = tempKV
+		kv.lastSerial = tempLastSerial
 	}
 }
 
@@ -270,6 +319,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.KV = make(map[string]string)
 	kv.lastSerial = make(map[int64]int64)
 	kv.leaderGet = make(map[int]chan Op)
+
+	kv.restoreState(persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
