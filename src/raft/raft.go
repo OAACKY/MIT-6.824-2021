@@ -356,6 +356,80 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (rf *Raft) PreVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.VoteGranted = false
+	if args.Term < rf.currentTerm {
+		return
+	}
+	temp := rf.votedFor
+	if args.Term > rf.currentTerm {
+		rf.votedFor = -1
+	}
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		if rf.getLastIndex() == 0 || rf.getLastTerm() < args.LastLogTerm ||
+			(rf.getLastTerm() == args.LastLogTerm && rf.getLastIndex() <= args.LastLogIndex) {
+			reply.VoteGranted = true
+		}
+	}
+	rf.votedFor = temp
+}
+
+func (rf *Raft) startPrevote() bool {
+	rf.mu.Lock()
+
+	args := RequestVoteArgs{}
+	args.Term = rf.currentTerm + 1
+	args.CandidateId = rf.me
+	args.LastLogIndex = rf.getLastIndex()
+	args.LastLogTerm = rf.getLastTerm()
+	rf.mu.Unlock()
+
+	voteNum := 1
+	finishNum := 1
+	cond := sync.NewCond(&rf.mu)
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(x int) {
+			reply := RequestVoteReply{}
+			//DPrintf("[%d] wait for request vote call to [%d]",rf.me,x)
+			ok := false
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				if ok == false {
+					finishNum++
+					cond.Broadcast()
+				}
+			}()
+			ok = rf.peers[x].Call("Raft.RequestVote", &args, &reply)
+			//DPrintf("[%d] receive request vote call to [%d]",rf.me,x)
+			rf.mu.Lock()
+			if rf.state == Candidate && ok {
+				if reply.VoteGranted {
+					voteNum++
+				}
+			}
+			finishNum++
+			cond.Broadcast()
+			rf.mu.Unlock()
+		}(i)
+	}
+	rf.mu.Lock()
+	for voteNum <= len(rf.peers)/2 && finishNum != len(rf.peers) {
+		cond.Wait()
+	}
+	if voteNum > len(rf.peers)/2 {
+		//DPrintf("[%d] become leader",rf.me)
+		rf.mu.Unlock()
+		return true
+	}
+	rf.mu.Unlock()
+	return false
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -534,6 +608,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	} else {
 		// update conflict index
+		//return
 		reply.ConfTerm = rf.getEntry(args.PrevLogIndex).Term
 		for i := 0; i < len(rf.log); i++ {
 			if rf.log[i].Term == reply.ConfTerm {
@@ -643,6 +718,7 @@ func (rf *Raft) startLeader() {
 	rf.leaderReady = true
 	rf.isReady.Broadcast()
 	rf.mu.Unlock()
+	rf.Start(0)
 
 	for rf.killed() == false {
 		DPrintf("[%d] leader begin send, time:%v", rf.me, time.Now())
@@ -789,6 +865,7 @@ func (rf *Raft) startLeader() {
 								}
 							}
 							// decrement nextIndex
+							//rf.nextIndex[x] -= 1
 							if reply.ConfTerm != -1 {
 								confTermIndex := -1
 								for i := args.PrevLogIndex - rf.firstIndex; i >= 1; i-- {
@@ -949,6 +1026,13 @@ func (rf *Raft) startCandidate() {
 		rf.mu.Unlock()
 		return
 	}
+
+	rf.mu.Unlock()
+	if !rf.startPrevote() {
+		return
+	}
+
+	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.persist()
